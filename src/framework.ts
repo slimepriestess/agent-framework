@@ -765,7 +765,7 @@ export class AgentFramework {
    *  `inference:exhausted` (which also pollutes the failure streak). Kept
    *  separate from ephemeralRuns deliberately: endTurn/budget cancels happen
    *  for resident agents too, and the key is per-stream, not per-agent. */
-  private frameworkCancelledStreams: Map<string, 'turn_ended' | 'budget_restart'> = new Map();
+  private frameworkCancelledStreams: Map<string, 'turn_ended' | 'budget_restart' | 'shutdown'> = new Map();
   /** Active runEphemeralToCompletion runs, keyed by agent name. */
   private ephemeralRuns: Map<string, EphemeralRun> = new Map();
   /** Per-agent count of consecutive exhausted inferences (reset on any success).
@@ -1306,10 +1306,17 @@ export class AgentFramework {
     // A stopped host must never hang behind its own cooldown.
     this.cancelProviderAdmission();
 
-    // Cancel all active streams
+    // Cancel all active streams. Membrane reports every cancel() as reason
+    // 'user' — it names the call, not the actor — so the provenance has to
+    // be recorded HERE, before the cancel, or driveStream would write a
+    // "[turn-interrupted] … stopped by the user" marker into a resident's
+    // durable context for a host that merely shut down (review of #134:
+    // Sol's repro, confirmed). A shutdown is neither a user's act nor a
+    // failure: the tracked branch in driveStream returns before either.
     for (const agent of this.agents.values()) {
       if (agent.state.status === 'streaming' ||
           (agent.state.status === 'waiting_for_tools' && agent.state.stream)) {
+        this.frameworkCancelledStreams.set(`${agent.name}:${agent.streamId}`, 'shutdown');
         agent.cancelStream();
       }
     }
@@ -6867,6 +6874,19 @@ export class AgentFramework {
                 if (cancelKind === 'turn_ended' && agent.proseRouting !== 'explicit') {
                   await turnSpeechChain;
                   this.appendProseDeliveryReceipt(agent);
+                }
+                // The trace carries the provenance we recorded, not the
+                // wire reason: a host observing 'inference:aborted' learns
+                // WHY the stream ended (the resident's transcript gets no
+                // marker for this — there is nothing to tell them that they
+                // did not do).
+                if (cancelKind === 'shutdown') {
+                  this.emitTrace({
+                    type: 'inference:aborted',
+                    agentName: agent.name,
+                    reason: 'shutdown',
+                    durationMs: Date.now() - startTime,
+                  });
                 }
                 return;
               }
