@@ -450,7 +450,9 @@ export class HistoryModule implements Module {
         '~0.3 is thematic, below ~0.2 is noise); each hit carries its id (`msg:<id>` or `sum:<id>`), ' +
         'timestamp, channel, kind/level and a snippet. The index catches up with recent messages before ' +
         'searching (bounded, so a huge backlog is reported as `index.behind` rather than blocking). ' +
-        'Purely a read: nothing is written to your history.',
+        'Purely a read: nothing is written to your history. Hits are checked against your current branch ' +
+        'before they come back: a message you undid or a summary from a branch you left is dropped and ' +
+        'counted in index.droppedOffBranch.',
       inputSchema: {
         type: 'object' as const,
         properties: {
@@ -774,7 +776,25 @@ export class HistoryModule implements Module {
       ts_to: toMs === undefined ? undefined : toMs / 1000,
       channel: channelId, kinds, level: input.level, min_score: input.minScore, snippet: SEMANTIC_SNIPPET_CHARS,
     });
-    const hits = res.hits.map((h) => ({
+    // The remote index is append-only and knows nothing about branches: a
+    // message removed from the agent's reach by /undo, /checkout, /restore or
+    // /newtopic keeps its id (a new message gets a fresh one) and stays
+    // indexed. Check every hit against the CURRENT branch before it goes back
+    // to the model — getMessage/getSummary rebuild on branch switch, so an
+    // undone message or a summary minted on another branch answers null.
+    // k is small, so this is at most `limit` local lookups.
+    const cm = this.cm as ContextManager;
+    let droppedOffBranch = 0;
+    const onBranch = res.hits.filter((h) => {
+      const msgId = /^msg:(.+)$/.exec(h.id)?.[1];
+      const sumId = /^sum:(.+)$/.exec(h.id)?.[1];
+      const present = msgId !== undefined ? cm.getMessage(msgId) !== null
+        : sumId !== undefined ? cm.getSummary(sumId) !== null
+        : true;
+      if (!present) droppedOffBranch++;
+      return present;
+    });
+    const hits = onBranch.map((h) => ({
       id: h.id,
       kind: h.kind,
       level: h.level,
@@ -795,6 +815,8 @@ export class HistoryModule implements Module {
           behind: sync ? sync.more : this.indexer === null ? null : true,
           syncedThisCall: sync ? sync.pushed : 0,
           lastError: this.indexer?.lastError ?? null,
+          /** Hits the index returned for messages/summaries not on the current branch (undone, checked out past). */
+          droppedOffBranch,
         },
         timingMs: res.timing_ms,
       },

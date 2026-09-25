@@ -59,8 +59,12 @@ function msg(id: string, ms: number, content: ContentBlock[], channelId?: string
   return { id, sequence: Number(id.replace(/\D/g, '')), participant: 'Linn', content, timestamp: new Date(ms),
     metadata: channelId ? { external: { source: 'discord', channelId, authorName: 'Linn' } } : undefined } as unknown as StoredMessage;
 }
-function stubCm(messages: StoredMessage[], summaries: Array<Record<string, unknown>> = []): ContextManager {
+function stubCm(messages: StoredMessage[], summaries: Array<Record<string, unknown>> = [], offBranch: Set<string> = new Set()): ContextManager {
   return {
+    // Branch-scoped like the real store: getMessage/getSummary answer null for
+    // anything not on the current branch (see MessageStore.lookupIndex).
+    getMessage(id: string) { return offBranch.has(id) ? null : (messages.find((m) => m.id === id) ?? null); },
+    getSummary(id: string) { return offBranch.has(id) ? null : (summaries.find((x) => x.id === id) ?? null); },
     queryMessagesByTime(o: { fromMs?: number; toMs?: number; limit?: number }) {
       const all = messages.filter((m) => (o.fromMs === undefined || m.timestamp.getTime() >= o.fromMs) && (o.toMs === undefined || m.timestamp.getTime() <= o.toMs))
         .sort((a, b) => a.timestamp.getTime() - b.timestamp.getTime());
@@ -127,6 +131,34 @@ describe('HistoryModule semantic_search', () => {
     await mod.handleToolCall({ id: 'c2', name: 'semantic_search', input: { query: 'evening', level: 1 } });
     assert.deepEqual(svc.searches.at(-1)!.kinds, ['summary']);
     await mod.stop();
+  });
+
+  it('drops hits for messages and summaries that are no longer on the current branch (/undo, /checkout)', async () => {
+    const svc2 = new FakeService(); await svc2.start();
+    try {
+      const mod = new HistoryModule({ semantic: { url: svc2.url, token: 'tok', namespace: 'test/ns', syncIntervalMs: 0 } });
+      const offBranch = new Set<string>();
+      mod.bind(stubCm(messages, summaries, offBranch));
+      await mod.syncSemanticIndex()!;
+      assert.ok(svc2.items.has('msg:m2') && svc2.items.has('sum:s1'));
+      // Before the undo: the think note is a hit.
+      const before = await mod.handleToolCall({ id: 'b', name: 'semantic_search', input: { query: 'private note', kinds: 'messages' } });
+      assert.equal(before.success, true, JSON.stringify(before));
+      assert.ok((before.data as { hits: Array<{ id: string }> }).hits.some((h) => h.id === 'msg:m2'));
+      // /undo to m1: m2 leaves the branch but stays in the remote index (ids are never reused).
+      offBranch.add('m2');
+      const after = await mod.handleToolCall({ id: 'a', name: 'semantic_search', input: { query: 'private note', kinds: 'messages' } });
+      const data = after.data as { hits: Array<{ id: string }>; index: { droppedOffBranch: number } };
+      assert.ok(!data.hits.some((h) => h.id === 'msg:m2'), JSON.stringify(data.hits));
+      assert.equal(data.index.droppedOffBranch, 1);
+      // Same rule for summaries minted on a branch the agent has left.
+      offBranch.add('s1');
+      const sum = await mod.handleToolCall({ id: 's', name: 'semantic_search', input: { query: 'evening', level: 1 } });
+      const sdata = sum.data as { hits: Array<{ id: string }>; index: { droppedOffBranch: number } };
+      assert.ok(!sdata.hits.some((h) => h.id === 'sum:s1'), JSON.stringify(sdata.hits));
+      assert.equal(sdata.index.droppedOffBranch, 1);
+      await mod.stop();
+    } finally { await svc2.stop(); }
   });
 
   it('service failure is a clean tool error and backs off sync', async () => {
